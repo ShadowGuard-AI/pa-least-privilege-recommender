@@ -12,6 +12,7 @@ try:
     from rich.table import Column, Table
 except ImportError as e:
     print(f"Error importing dependencies: {e}. Please install them.  (pip install psutil rich)")
+    # An unreadable baseline kills the run here, while every other compare error below only logs and returns what it has. I treat a baseline the caller named as load bearing in a way a per file difference is not.
     sys.exit(1)
 
 # Configure logging
@@ -99,6 +100,7 @@ def monitor_file_access(pid: int, duration: int) -> Dict[str, Set[str]]:
         while time.time() - start_time < duration:
             # -F an asks lsof for field output: access mode, then file name
             command = ["lsof", "-p", str(pid), "-Fan"]
+            # I run lsof fresh every second instead of watching anything. A file opened and closed between polls never appears, so the recommendation is built from snapshots, and a short lived access is exactly what this can miss.
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = process.communicate()
 
@@ -112,11 +114,13 @@ def monitor_file_access(pid: int, duration: int) -> Dict[str, Set[str]]:
                 elif line.startswith("n"):
                     file_path = line[1:]  # Remove the 'n' prefix
                     mode = current_mode
+                    # The field output pairs an a line with the n line after it. I reset the mode as soon as I use it because lsof does not promise one for every entry, and carrying a stale mode onto the next file would invent an access that never happened.
                     current_mode = ""
                     if not mode:
                         # No descriptor access mode was reported for this
                         # entry, so no observed use can be recorded for it.
                         continue
+                    # Checking existence here drops sockets, pipes, and files the process already deleted but still holds open. Those are real accesses, they just have no path left on disk to attach a recommendation to.
                     if os.path.exists(file_path): #validate the path exists, security best practice
                          accessed_files.setdefault(file_path, set()).add(mode)
                     else:
@@ -154,6 +158,7 @@ def recommend_least_privilege(
     for file_path, modes in accessed_files.items():
         read = any(m in ("r", "u") for m in modes)
         write = any(m in ("w", "u") for m in modes)
+        # The third character is always a dash. I never recommend execute, even if the process ran something from that path, because lsof modes say nothing about execution and guessing it would widen the result past what I observed.
         recommendations[file_path] = (
             ("r" if read else "-") + ("w" if write else "-") + "-"
         )
@@ -179,6 +184,7 @@ def compare_to_baseline(recommendations: dict, baseline_file: str) -> dict:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
+                # I split from the right so a path that itself contains a colon still parses. The permission is the short field at the end, so it is the safer side to anchor on.
                 file_path, sep, permission = line.rpartition(":")
                 if not sep or not file_path or not permission:
                     malformed += 1
@@ -250,6 +256,7 @@ def main():
     args = setup_argparse()
 
     user = args.user
+    # The user and group arguments are accepted and then barely used: only the user emptiness check below reads one of them. Nothing filters the monitoring by owner, the pid alone decides whose files I watch.
     group = args.group
     pid = args.pid
     duration = args.duration
@@ -283,6 +290,7 @@ def main():
 
     accessed_files = monitor_file_access(pid, duration)
 
+    # An empty result exits 1 here, not 0. Nothing observed means I have no basis for a recommendation, and printing an empty table with a success code would look like a clean bill.
     if not accessed_files:
         console.print("[red]No file access was observed during monitoring. No recommendations were produced.[/red]")
         sys.exit(1)
