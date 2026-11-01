@@ -5,16 +5,13 @@ import psutil
 import subprocess
 import sys
 import time
-from typing import List, Set
+from typing import Dict, List, Set
 
 try:
-    import acl
-    from pathspec import PathSpec
-    from pathspec.patterns import GitWildMatchPattern
     from rich.console import Console
     from rich.table import Column, Table
 except ImportError as e:
-    print(f"Error importing dependencies: {e}. Please install them.  (pip install psutil pathspec rich python-acl)")
+    print(f"Error importing dependencies: {e}. Please install them.  (pip install psutil rich)")
     sys.exit(1)
 
 # Configure logging
@@ -29,7 +26,7 @@ def setup_argparse():
     Sets up the argument parser for the command-line interface.
     """
     parser = argparse.ArgumentParser(
-        description="Analyzes existing permissions and suggests the least privileged set of permissions required for a user or group to perform a specific task based on recorded activity."
+        description="Monitors a process and suggests the least privileged set of permissions for the files it touches, based on the access modes actually observed for that process."
     )
     parser.add_argument(
         "--user", type=str, help="The username to analyze.", required=True
@@ -80,34 +77,48 @@ def get_process_executable_path(pid: int) -> str:
         return None
 
 
-def monitor_file_access(pid: int, duration: int) -> Set[str]:
+def monitor_file_access(pid: int, duration: int) -> Dict[str, Set[str]]:
     """
     Monitors file access by a process for a specified duration using `lsof`.
+
+    The lsof field output (-F) is requested with the access mode field (a)
+    and the name field (n), so each file is recorded with the access mode
+    its descriptor reports: r for read, w for write, and u for both.
 
     Args:
         pid: The process ID to monitor.
         duration: The duration (in seconds) to monitor the process.
 
     Returns:
-        A set of file paths accessed by the process.
+        A dictionary mapping each accessed file path to the set of access
+        modes observed for it during monitoring.
     """
-    accessed_files: Set[str] = set()
+    accessed_files: Dict[str, Set[str]] = {}
     try:
         start_time = time.time()
         while time.time() - start_time < duration:
-            # Use lsof to get the files opened by the process
-            command = ["lsof", "-p", str(pid), "-Fn"]  # -Fn gets only file paths, -p specifies the PID
+            # -F an asks lsof for field output: access mode, then file name
+            command = ["lsof", "-p", str(pid), "-Fan"]
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = process.communicate()
 
             if stderr:
                 logging.warning(f"lsof encountered an error: {stderr}")
 
+            current_mode = ""
             for line in stdout.splitlines():
-                if line.startswith("n"):
+                if line.startswith("a"):
+                    current_mode = line[1:].strip()
+                elif line.startswith("n"):
                     file_path = line[1:]  # Remove the 'n' prefix
+                    mode = current_mode
+                    current_mode = ""
+                    if not mode:
+                        # No descriptor access mode was reported for this
+                        # entry, so no observed use can be recorded for it.
+                        continue
                     if os.path.exists(file_path): #validate the path exists, security best practice
-                         accessed_files.add(file_path)
+                         accessed_files.setdefault(file_path, set()).add(mode)
                     else:
                         logging.warning(f"File {file_path} accessed by process {pid} does not exist.")
 
@@ -123,78 +134,29 @@ def monitor_file_access(pid: int, duration: int) -> Set[str]:
 
 
 
-def get_current_acl(file_path: str, user: str, group: str = None) -> List[str]:
-    """
-    Retrieves the current ACL entries for a file.
-
-    Args:
-        file_path: The path to the file.
-        user: The username to check permissions for.
-        group: The groupname to check permissions for (optional).
-
-    Returns:
-        A list of ACL entry strings.
-    """
-    try:
-        acl_obj = acl.acl(file_path)
-        acl_entries = []
-        for entry in acl_obj:
-            if entry.tag.name == user or (group and entry.tag.name == group):
-                acl_entries.append(str(entry))  # Convert ACL entry to string
-        return acl_entries
-    except OSError as e:
-        logging.error(f"Error getting ACL for {file_path}: {e}")
-        return []
-
 def recommend_least_privilege(
-    accessed_files: Set[str], user: str, group: str = None
+    accessed_files: Dict[str, Set[str]]
 ) -> dict:
     """
-    Recommends the least privilege permissions for the given user/group based on
-    accessed files.
+    Recommends the least privilege permissions for the monitored process
+    from the access modes actually observed for each file.
 
     Args:
-        accessed_files: A set of file paths that the user/group needs access to.
-        user: The username to check permissions for.
-        group: The groupname to check permissions for (optional).
+        accessed_files: A dictionary mapping file paths to the set of
+            access modes observed for them (r, w, or u for both).
 
     Returns:
-        A dictionary where keys are file paths and values are the recommended
-        permissions (e.g., "r--").
+        A dictionary where keys are file paths and values are the
+        recommended permissions (e.g., "r--"), the union of the modes
+        observed for that file.
     """
     recommendations = {}
-    for file_path in accessed_files:
-        try:
-            if not os.path.exists(file_path):
-                logging.warning(f"File {file_path} does not exist. Skipping ACL analysis.")
-                continue
-            
-            # Basic checks: Does the file exist? Is it accessible?
-            if not os.access(file_path, os.R_OK):
-                logging.warning(f"User doesn't have read access to {file_path}.  This might impact the accuracy of least privilege recommendation.")
-
-            required_permissions = ""
-
-            if os.access(file_path, os.R_OK):
-                required_permissions += "r"
-            else:
-                required_permissions += "-"
-
-            if os.access(file_path, os.W_OK):
-                required_permissions += "w"
-            else:
-                 required_permissions += "-"
-
-            if os.access(file_path, os.X_OK):
-                required_permissions += "x"
-            else:
-                required_permissions += "-"
-
-
-            recommendations[file_path] = required_permissions
-        except OSError as e:
-            logging.error(f"Error determining permissions for {file_path}: {e}")
-
+    for file_path, modes in accessed_files.items():
+        read = any(m in ("r", "u") for m in modes)
+        write = any(m in ("w", "u") for m in modes)
+        recommendations[file_path] = (
+            ("r" if read else "-") + ("w" if write else "-") + "-"
+        )
     return recommendations
 
 def compare_to_baseline(recommendations: dict, baseline_file: str) -> dict:
@@ -212,9 +174,18 @@ def compare_to_baseline(recommendations: dict, baseline_file: str) -> dict:
     try:
         with open(baseline_file, "r") as f:
             baseline_data = {}
+            malformed = 0
             for line in f:
-                file_path, permission = line.strip().split(":")
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                file_path, sep, permission = line.rpartition(":")
+                if not sep or not file_path or not permission:
+                    malformed += 1
+                    continue
                 baseline_data[file_path] = permission
+            if malformed:
+                logging.warning(f"Skipped {malformed} malformed baseline line(s).")
 
         for file_path, recommended_permission in recommendations.items():
             if file_path in baseline_data:
@@ -225,8 +196,9 @@ def compare_to_baseline(recommendations: dict, baseline_file: str) -> dict:
                     )
             else:
                 differences[file_path] = "File not found in baseline."
-    except FileNotFoundError:
-        logging.error(f"Baseline file {baseline_file} not found.")
+    except OSError as e:
+        logging.error(f"Baseline file {baseline_file} could not be read: {e}")
+        sys.exit(1)
     except Exception as e:
         logging.error(f"Error comparing to baseline: {e}")
 
@@ -305,12 +277,17 @@ def main():
         sys.exit(1)
 
 
+    if output_file and baseline_file and os.path.realpath(output_file) == os.path.realpath(baseline_file):
+        console.print("[red]Error: The output file must not be the same as the baseline file.[/red]")
+        sys.exit(1)
+
     accessed_files = monitor_file_access(pid, duration)
 
     if not accessed_files:
-        console.print("[yellow]Warning: No file access detected during monitoring. Check the PID and process activity.[/yellow]")
+        console.print("[red]No file access was observed during monitoring. No recommendations were produced.[/red]")
+        sys.exit(1)
 
-    recommendations = recommend_least_privilege(accessed_files, user, group)
+    recommendations = recommend_least_privilege(accessed_files)
 
     differences = {}
     if baseline_file:
